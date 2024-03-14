@@ -8,6 +8,9 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/vectorized/dn404.git"
+    "url": "git+https://github.com/eisvogelETH/BULLPOGS-dn404.git"
+  },
+  "dependencies": {
+    "dn404": "^0.0.13"
   }
 }
