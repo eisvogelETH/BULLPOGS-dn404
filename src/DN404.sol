@@ -312,8 +312,10 @@ abstract contract DN404 {
     /*                      ERC20 OPERATIONS                      */
     /*-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»-»*/
 
-    /// @dev Returns the decimals places of the token. Always 18.
-    function decimals() public pure returns (uint8) {
+    /// @dev Returns the decimals places of the token. Defaults to 18.
+    /// Does not affect DN404's internal calculations.
+    /// Will only affect the frontend UI on most protocols.
+    function decimals() public view virtual returns (uint8) {
         return 18;
     }
 
@@ -331,7 +333,7 @@ abstract contract DN404 {
     function allowance(address owner, address spender) public view returns (uint256) {
         if (_givePermit2DefaultInfiniteAllowance() && spender == _PERMIT2) {
             uint8 flags = _getDN404Storage().addressData[owner].flags;
-            if (flags & _ADDRESS_DATA_OVERRIDE_PERMIT2_FLAG == 0) return type(uint256).max;
+            if (_isZero(flags & _ADDRESS_DATA_OVERRIDE_PERMIT2_FLAG)) return type(uint256).max;
         }
         return _ref(_getDN404Storage().allowance, owner, spender).value;
     }
@@ -382,7 +384,7 @@ abstract contract DN404 {
         Uint256Ref storage a = _ref(_getDN404Storage().allowance, from, msg.sender);
 
         uint256 allowed = _givePermit2DefaultInfiniteAllowance() && msg.sender == _PERMIT2
-            && (_getDN404Storage().addressData[from].flags & _ADDRESS_DATA_OVERRIDE_PERMIT2_FLAG) == 0
+            && _isZero(_getDN404Storage().addressData[from].flags & _ADDRESS_DATA_OVERRIDE_PERMIT2_FLAG)
             ? type(uint256).max
             : a.value;
 
@@ -439,7 +441,7 @@ abstract contract DN404 {
             maxId = totalSupply_ / _unit();
         }
         unchecked {
-            if (toAddressData.flags & _ADDRESS_DATA_SKIP_NFT_FLAG == 0) {
+            if (_isZero(toAddressData.flags & _ADDRESS_DATA_SKIP_NFT_FLAG)) {
                 Uint32Map storage toOwned = $.owned[to];
                 Uint32Map storage oo = $.oo;
                 uint256 toIndex = toAddressData.ownedLength;
@@ -521,7 +523,7 @@ abstract contract DN404 {
             maxId = totalSupply_ / _unit();
         }
         unchecked {
-            if (toAddressData.flags & _ADDRESS_DATA_SKIP_NFT_FLAG == 0) {
+            if (_isZero(toAddressData.flags & _ADDRESS_DATA_SKIP_NFT_FLAG)) {
                 Uint32Map storage toOwned = $.owned[to];
                 Uint32Map storage oo = $.oo;
                 uint256 toIndex = toAddressData.ownedLength;
@@ -571,10 +573,10 @@ abstract contract DN404 {
     ///
     /// Emits a {Transfer} event.
     function _burn(address from, uint256 amount) internal virtual {
-        AddressData storage fromAddressData = _addressData(from);
         DN404Storage storage $ = _getDN404Storage();
         if ($.mirrorERC721 == address(0)) revert DNNotInitialized();
 
+        AddressData storage fromAddressData = $.addressData[from];
         uint256 fromBalance = fromAddressData.balance;
         if (amount > fromBalance) revert InsufficientBalance();
 
@@ -644,9 +646,9 @@ abstract contract DN404 {
     function _transfer(address from, address to, uint256 amount) internal virtual {
         if (to == address(0)) revert TransferToZeroAddress();
 
-        AddressData storage fromAddressData = _addressData(from);
-        AddressData storage toAddressData = _addressData(to);
         DN404Storage storage $ = _getDN404Storage();
+        AddressData storage fromAddressData = $.addressData[from];
+        AddressData storage toAddressData = _addressData(to);
         if ($.mirrorERC721 == address(0)) revert DNNotInitialized();
 
         _DNTransferTemps memory t;
@@ -663,7 +665,7 @@ abstract contract DN404 {
                 toAddressData.balance = uint96(toBalance);
                 t.numNFTBurns = _zeroFloorSub(t.fromOwnedLength, fromBalance / _unit());
 
-                if (toAddressData.flags & _ADDRESS_DATA_SKIP_NFT_FLAG == 0) {
+                if (_isZero(toAddressData.flags & _ADDRESS_DATA_SKIP_NFT_FLAG)) {
                     if (from == to) t.toOwnedLength = t.fromOwnedLength - t.numNFTBurns;
                     t.numNFTMints = _zeroFloorSub(toBalance / _unit(), t.toOwnedLength);
                 }
@@ -671,7 +673,7 @@ abstract contract DN404 {
 
             while (_useDirectTransfersIfPossible()) {
                 uint256 n = _min(t.fromOwnedLength, _min(t.numNFTBurns, t.numNFTMints));
-                if (n == 0) break;
+                if (_isZero(n)) break;
                 t.numNFTBurns -= n;
                 t.numNFTMints -= n;
                 if (from == to) {
@@ -683,18 +685,19 @@ abstract contract DN404 {
                 Uint32Map storage toOwned = $.owned[to];
                 t.toAlias = _registerAndResolveAlias(toAddressData, to);
                 uint256 toIndex = t.toOwnedLength;
+                n = toIndex + n;
                 // Direct transfer loop.
                 do {
                     uint256 id = _get(fromOwned, --t.fromOwnedLength);
                     _set(toOwned, toIndex, uint32(id));
-                    _setOwnerAliasAndOwnedIndex($.oo, id, t.toAlias, uint32(toIndex++));
+                    _setOwnerAliasAndOwnedIndex($.oo, id, t.toAlias, uint32(toIndex));
                     _directLogsAppend(directLogs, id);
                     if (_get($.mayHaveNFTApproval, id)) {
                         _set($.mayHaveNFTApproval, id, false);
                         delete $.nftApprovals[id];
                     }
                     _afterNFTTransfer(from, to, id);
-                } while (--n != 0);
+                } while (++toIndex != n);
 
                 toAddressData.ownedLength = uint32(t.toOwnedLength = toIndex);
                 fromAddressData.ownedLength = uint32(t.fromOwnedLength);
@@ -779,6 +782,29 @@ abstract contract DN404 {
     }
 
     /// @dev Transfers token `id` from `from` to `to`.
+    /// Also emits an ERC721 {Transfer} event on the `mirrorERC721`.
+    ///
+    /// Requirements:
+    ///
+    /// - Call must originate from the mirror contract.
+    /// - Token `id` must exist.
+    /// - `from` must be the owner of the token.
+    /// - `to` cannot be the zero address.
+    ///   `msgSender` must be the owner of the token, or be approved to manage the token.
+    ///
+    /// Emits a {Transfer} event.
+    function _initiateTransferFromNFT(address from, address to, uint256 id, address msgSender)
+        internal
+        virtual
+    {
+        _transferFromNFT(from, to, id, msgSender);
+        // Emit ERC721 {Transfer} event.
+        _DNDirectLogs memory directLogs = _directLogsMalloc(1, from, to);
+        _directLogsAppend(directLogs, id);
+        _directLogsSend(directLogs, _getDN404Storage().mirrorERC721);
+    }
+
+    /// @dev Transfers token `id` from `from` to `to`.
     ///
     /// Requirements:
     ///
@@ -805,19 +831,18 @@ abstract contract DN404 {
         }
 
         if (msgSender != from) {
-            if (_ref($.operatorApprovals, from, msgSender).value == 0) {
-                if (msgSender != $.nftApprovals[id]) {
+            if (!_isApprovedForAll(from, msgSender)) {
+                if (_getApproved(id) != msgSender) {
                     revert TransferCallerNotOwnerNorApproved();
                 }
             }
         }
 
-        AddressData storage fromAddressData = _addressData(from);
-        AddressData storage toAddressData = _addressData(to);
+        AddressData storage fromAddressData = $.addressData[from];
+        AddressData storage toAddressData = $.addressData[to];
 
         uint256 unit = _unit();
         mapping(address => Uint32Map) storage owned = $.owned;
-        Uint32Map storage fromOwned = owned[from];
 
         unchecked {
             uint256 fromBalance = fromAddressData.balance;
@@ -830,6 +855,7 @@ abstract contract DN404 {
             delete $.nftApprovals[id];
         }
         unchecked {
+            Uint32Map storage fromOwned = owned[from];
             uint32 updatedId = _get(fromOwned, --fromAddressData.ownedLength);
             uint32 i = _get(oo, _ownedIndex(id));
             _set(fromOwned, i, updatedId);
@@ -897,7 +923,7 @@ abstract contract DN404 {
     /// Returns false otherwise.
     function getSkipNFT(address owner) public view virtual returns (bool) {
         AddressData storage d = _getDN404Storage().addressData[owner];
-        if (d.flags & _ADDRESS_DATA_INITIALIZED_FLAG == 0) return _hasCode(owner);
+        if (_isZero(d.flags & _ADDRESS_DATA_INITIALIZED_FLAG)) return _hasCode(owner);
         return d.flags & _ADDRESS_DATA_SKIP_NFT_FLAG != 0;
     }
 
@@ -932,7 +958,7 @@ abstract contract DN404 {
     function _addressData(address owner) internal virtual returns (AddressData storage d) {
         d = _getDN404Storage().addressData[owner];
         unchecked {
-            if (d.flags & _ADDRESS_DATA_INITIALIZED_FLAG == 0) {
+            if (_isZero(d.flags & _ADDRESS_DATA_INITIALIZED_FLAG)) {
                 uint256 skipNFT = _toUint(_hasCode(owner)) * _ADDRESS_DATA_SKIP_NFT_FLAG;
                 d.flags = uint8(skipNFT | _ADDRESS_DATA_INITIALIZED_FLAG);
             }
@@ -949,13 +975,13 @@ abstract contract DN404 {
     {
         DN404Storage storage $ = _getDN404Storage();
         addressAlias = toAddressData.addressAlias;
-        if (addressAlias == 0) {
+        if (_isZero(addressAlias)) {
             unchecked {
                 addressAlias = ++$.numAliases;
             }
             toAddressData.addressAlias = addressAlias;
             $.aliasToAddress[addressAlias] = to;
-            if (addressAlias == 0) revert(); // Overflow.
+            if (_isZero(addressAlias)) revert(); // Overflow.
         }
     }
 
@@ -994,6 +1020,16 @@ abstract contract DN404 {
         return _ownerAt(id);
     }
 
+    /// @dev Returns whether `operator` is approved to manage the NFT tokens of `owner`.
+    function _isApprovedForAll(address owner, address operator)
+        internal
+        view
+        virtual
+        returns (bool)
+    {
+        return !_isZero(_ref(_getDN404Storage().operatorApprovals, owner, operator).value);
+    }
+
     /// @dev Returns if token `id` exists.
     function _exists(uint256 id) internal view virtual returns (bool) {
         return _ownerAt(id) != address(0);
@@ -1022,7 +1058,7 @@ abstract contract DN404 {
         owner = $.aliasToAddress[_get($.oo, _ownershipIndex(_restrictNFTId(id)))];
 
         if (msgSender != owner) {
-            if (_ref($.operatorApprovals, owner, msgSender).value == 0) {
+            if (!_isApprovedForAll(owner, msgSender)) {
                 revert ApprovalCallerNotOwnerNorApproved();
             }
         }
@@ -1096,12 +1132,11 @@ abstract contract DN404 {
         }
         // `isApprovedForAll(address,address)`.
         if (fnSelector == 0xe985e9c5) {
-            Uint256Ref storage ref = _ref(
-                $.operatorApprovals,
+            bool result = _isApprovedForAll(
                 address(uint160(_calldataload(0x04))), // `owner`.
                 address(uint160(_calldataload(0x24))) // `operator`.
             );
-            _return(ref.value);
+            _return(_toUint(result));
         }
         // `ownerOf(uint256)`.
         if (fnSelector == 0x6352211e) {
@@ -1143,9 +1178,11 @@ abstract contract DN404 {
             /// @solidity memory-safe-assembly
             assembly {
                 // Memory safe, as we've advanced the free memory pointer by a word.
-                let o := sub(uri, 0x20)
+                let o := sub(uri, 0x20) // Start of the returndata.
+                let z := add(mload(uri), 0x40) // Unpadded length of returndata.
+                mstore(add(o, z), 0) // Zeroize the word after the end of the string.
                 mstore(o, 0x20) // Store the offset of `uri`.
-                return(o, add(0x60, mload(uri)))
+                return(o, and(not(0x1f), add(0x1f, z)))
             }
         }
         // `implementsDN404()`.
@@ -1270,11 +1307,15 @@ abstract contract DN404 {
             }
             if negBits {
                 // Find-first-set routine.
+                // From: https://github.com/vectorized/solady/blob/main/src/utils/LibBit.sol
                 let b := and(negBits, add(not(negBits), 1)) // Isolate the least significant bit.
-                let r := shl(7, lt(0xffffffffffffffffffffffffffffffff, b))
-                r := or(r, shl(6, lt(0xffffffffffffffff, shr(r, b))))
-                r := or(r, shl(5, lt(0xffffffff, shr(r, b))))
-                // For the remaining 32 bits, use a De Bruijn lookup.
+                // For the upper 3 bits of the result, use a De Bruijn-like lookup.
+                // Credit to adhusson: https://blog.adhusson.com/cheap-find-first-set-evm/
+                // forgefmt: disable-next-item
+                let r := shl(5, shr(252, shl(shl(2, shr(250, mul(b,
+                    0x2aaaaaaaba69a69a6db6db6db2cb2cb2ce739ce73def7bdeffffffff))),
+                    0x1412563212c14164235266736f7425221143267a45243675267677)))
+                // For the lower 5 bits of the result, use a De Bruijn lookup.
                 // forgefmt: disable-next-item
                 r := or(r, byte(and(div(0xd76453e0, shr(r, b)), 0x1f),
                     0x001f0d1e100c1d070f090b19131c1706010e11080a1a141802121b1503160405))
@@ -1347,6 +1388,14 @@ abstract contract DN404 {
         /// @solidity memory-safe-assembly
         assembly {
             result := iszero(iszero(b))
+        }
+    }
+
+    /// @dev Returns `b == 0`. This is because solc is sometimes dumb.
+    function _isZero(uint256 x) internal pure returns (bool result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := iszero(x)
         }
     }
 
